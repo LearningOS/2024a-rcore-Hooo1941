@@ -22,7 +22,9 @@ mod switch;
 #[allow(rustdoc::private_intra_doc_links)]
 mod task;
 
-use crate::fs::{open_file, OpenFlags};
+use crate::{
+    fs::{open_file, OpenFlags}, mm::MapPermission, syscall::TaskInfo, timer::get_time_us,
+};
 use alloc::sync::Arc;
 pub use context::TaskContext;
 use lazy_static::*;
@@ -57,6 +59,9 @@ pub fn suspend_current_and_run_next() {
 
 /// pid of usertests app in make run TEST=1
 pub const IDLE_PID: usize = 0;
+
+/// BIG_STRIDE
+pub const BIG_STRIDE: usize = 10000000;
 
 /// Exit the current 'Running' task and run the next task in task list.
 pub fn exit_current_and_run_next(exit_code: i32) {
@@ -119,4 +124,40 @@ lazy_static! {
 ///Add init process to the manager
 pub fn add_initproc() {
     add_task(INITPROC.clone());
+}
+
+/// Get the current task's TCB
+pub fn get_curr_task_status() -> TaskInfo {
+    let tcb = current_task().unwrap();
+    let tcb = tcb.inner_exclusive_access();
+    let us_now = get_time_us();
+    TaskInfo {
+        status: TaskStatus::Running,
+        syscall_times: tcb.syscall_times.clone(),
+        time: (us_now - tcb.first_time) / 1000,
+    }
+}
+/// Add syscall times for current task
+pub fn add_syscall_times(syscall_id: usize) {
+    let tcb = current_task().unwrap();
+    tcb.inner_exclusive_access().syscall_times[syscall_id] += 1;
+}
+
+/// mmap
+pub fn mmap(start: usize, end: usize, perm: MapPermission) -> isize {
+    let tcb = current_task().unwrap();
+    let x = tcb
+        .inner_exclusive_access()
+        .memory_set
+        .insert_framed_area_check(start.into(), end.into(), perm);
+    x
+}
+///munmap
+pub fn munmap(start: usize, end: usize) -> isize {
+    let tcb = current_task().unwrap();
+    let x = tcb
+        .inner_exclusive_access()
+        .memory_set
+        .remove_framed_area(start.into(), end.into());
+    x
 }

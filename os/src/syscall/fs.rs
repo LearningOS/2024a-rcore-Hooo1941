@@ -1,6 +1,7 @@
 //! File and filesystem-related syscalls
-use crate::fs::{open_file, OpenFlags, Stat};
-use crate::mm::{translated_byte_buffer, translated_str, UserBuffer};
+
+use crate::fs::{link_file, open_file, unlink_file, OpenFlags, Stat};
+use crate::mm::{copy_to_user, translated_byte_buffer, translated_str, UserBuffer};
 use crate::task::{current_task, current_user_token};
 
 pub fn sys_write(fd: usize, buf: *const u8, len: usize) -> isize {
@@ -77,27 +78,55 @@ pub fn sys_close(fd: usize) -> isize {
 
 /// YOUR JOB: Implement fstat.
 pub fn sys_fstat(_fd: usize, _st: *mut Stat) -> isize {
-    trace!(
-        "kernel:pid[{}] sys_fstat NOT IMPLEMENTED",
-        current_task().unwrap().pid.0
-    );
-    -1
+    trace!("kernel:pid[{}] sys_fstat", current_task().unwrap().pid.0);
+    let token = current_user_token();
+    let task = current_task().unwrap();
+    let inner = task.inner_exclusive_access();
+
+    if let Some(inode) = &inner.fd_table[_fd] {
+        let stat = inode.stat();
+        drop(inner);
+        copy_to_user(
+            token,
+            _st as *mut u8,
+            &stat as *const Stat as *const u8,
+            core::mem::size_of::<Stat>(),
+        );
+        0
+    } else {
+        -1
+    }
 }
 
 /// YOUR JOB: Implement linkat.
 pub fn sys_linkat(_old_name: *const u8, _new_name: *const u8) -> isize {
-    trace!(
-        "kernel:pid[{}] sys_linkat NOT IMPLEMENTED",
-        current_task().unwrap().pid.0
-    );
-    -1
+    trace!("kernel:pid[{}] sys_linkat", current_task().unwrap().pid.0);
+    let token = current_user_token();
+    let path_old = translated_str(token, _old_name);
+    let path_new = translated_str(token, _new_name);
+    if path_new == path_old {
+        return -1;
+    }
+    if let Some(inode) = open_file(path_old.as_str(), OpenFlags::RDONLY) {
+        link_file(path_new.as_str(), inode);
+        0
+    } else {
+        -1
+    }
 }
 
 /// YOUR JOB: Implement unlinkat.
 pub fn sys_unlinkat(_name: *const u8) -> isize {
     trace!(
-        "kernel:pid[{}] sys_unlinkat NOT IMPLEMENTED",
+        "kernel:pid[{}] sys_unlinkat",
         current_task().unwrap().pid.0
     );
-    -1
+    let token = current_user_token();
+    let path = translated_str(token, _name);
+    if let Some(_) = open_file(path.as_str(), OpenFlags::RDONLY) {
+        unlink_file(path.as_str());
+        0
+    } else {
+        -1
+    }
 }
