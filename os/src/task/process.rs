@@ -2,9 +2,9 @@
 
 use super::id::RecycleAllocator;
 use super::manager::insert_into_pid2process;
-use super::TaskControlBlock;
 use super::{add_task, SignalFlags};
 use super::{pid_alloc, PidHandle};
+use super::{TaskControlBlock, TaskStatus};
 use crate::fs::{File, Stdin, Stdout};
 use crate::mm::{translated_refmut, MemorySet, KERNEL_SPACE};
 use crate::sync::{Condvar, Mutex, Semaphore, UPSafeCell};
@@ -14,6 +14,7 @@ use alloc::sync::{Arc, Weak};
 use alloc::vec;
 use alloc::vec::Vec;
 use core::cell::RefMut;
+use core::cmp::max;
 
 /// Process Control Block
 pub struct ProcessControlBlock {
@@ -49,6 +50,14 @@ pub struct ProcessControlBlockInner {
     pub semaphore_list: Vec<Option<Arc<Semaphore>>>,
     /// condvar list
     pub condvar_list: Vec<Option<Arc<Condvar>>>,
+    /// Allocation mutex list
+    pub allocation_mutex_list: Vec<Vec<usize>>,
+    /// Allocation semaphore list
+    pub allocation_semaphore_list: Vec<Vec<usize>>,
+    /// enable_deadlock_detect
+    pub enable_deadlock_detect: bool,
+    /// semaphore need list
+    pub need_list: Vec<Vec<usize>>,
 }
 
 impl ProcessControlBlockInner {
@@ -119,6 +128,10 @@ impl ProcessControlBlock {
                     mutex_list: Vec::new(),
                     semaphore_list: Vec::new(),
                     condvar_list: Vec::new(),
+                    allocation_mutex_list: vec![vec![]],
+                    allocation_semaphore_list: vec![vec![]],
+                    enable_deadlock_detect: false,
+                    need_list: vec![vec![]],
                 })
             },
         });
@@ -245,6 +258,10 @@ impl ProcessControlBlock {
                     mutex_list: Vec::new(),
                     semaphore_list: Vec::new(),
                     condvar_list: Vec::new(),
+                    allocation_mutex_list: vec![vec![]],
+                    allocation_semaphore_list: vec![vec![]],
+                    enable_deadlock_detect: false,
+                    need_list: vec![vec![]],
                 })
             },
         });
@@ -281,5 +298,120 @@ impl ProcessControlBlock {
     /// get pid
     pub fn getpid(&self) -> usize {
         self.pid.0
+    }
+
+    /// mutex_lock
+    /// testset oriented programming
+    pub fn mutex_lock(&self, mutex_id: usize) -> bool {
+        let mut inner = self.inner_exclusive_access();
+        let tid = inner.tasks.iter().position(|x| {
+            x.clone()
+                .is_some_and(|x| x.inner_exclusive_access().task_status == TaskStatus::Running)
+        });
+        if tid.is_none() {
+            panic!("Find running task failed!!!");
+        }
+        let tid = tid.unwrap();
+        if inner.enable_deadlock_detect {
+            // only need to consider self take self
+            if inner.allocation_mutex_list[tid][mutex_id] == 1 {
+                return false;
+            }
+        }
+        inner.allocation_mutex_list[tid][mutex_id] += 1;
+        true
+    }
+    /// mutex_unlock
+    pub fn mutex_unlock(&self, mutex_id: usize) {
+        let mut inner = self.inner_exclusive_access();
+        let tid = inner.tasks.iter().position(|x| {
+            x.clone()
+                .is_some_and(|x| x.inner_exclusive_access().task_status == TaskStatus::Running)
+        });
+        if tid.is_none() {
+            panic!("Find running task failed!!!");
+        }
+        let tid = tid.unwrap();
+        inner.allocation_mutex_list[tid][mutex_id] -= 1;
+    }
+    /// sem_down
+    pub fn sem_down(&self, sem_id: usize) -> bool {
+        let inner = self.inner_exclusive_access();
+        let tid = inner.tasks.iter().position(|x| {
+            x.clone()
+                .is_some_and(|x| x.inner_exclusive_access().task_status == TaskStatus::Running)
+        });
+        if tid.is_none() {
+            panic!("Find running task failed!!!");
+        }
+        let tid = tid.unwrap();
+        let tlen = inner.tasks.len();
+        if inner.enable_deadlock_detect {
+            let allocation = inner.allocation_semaphore_list.clone();
+            let mut work = vec![1; inner.semaphore_list.len()];
+            for i in 0..inner.semaphore_list.len() {
+                work[i] = max(0, inner.semaphore_list[i].as_ref().unwrap().inner.exclusive_access().count) as usize;
+            }
+            // need
+            let mut need = inner.need_list.clone();
+            need[tid][sem_id] = 1;
+            // log
+            info!("work: {:?}", work);
+            for i in 0..tlen {
+                info!("tid: {}", i);
+                info!("allocation: {:?}", allocation[i]);
+                info!("need: {:?}", need[i]);
+            }
+            let mut finish = vec![false; tlen];
+            loop {
+                let mut found = false;
+                for i in 0..tlen {
+                    if finish[i] {
+                        continue;
+                    }
+                    if inner.tasks[i].is_none() {
+                        finish[i] = true;
+                        found = true;
+                        break;
+                    }
+                    // Need[i,j] <= Work[j];
+                    let mut flag = true;
+                    for j in 0..inner.semaphore_list.len() {
+                        if need[i][j] > work[j] {
+                            flag = false;
+                            break;
+                        }
+                    }
+                    if flag {
+                        // Work += Allocation[i];
+                        for j in 0..inner.semaphore_list.len() {
+                            work[j] += allocation[i][j];
+                        }
+                        finish[i] = true;
+                        found = true;
+                        break;
+                    }
+                }
+                if found {
+                    continue;
+                }
+                for i in finish.iter() {
+                    if !i {
+                        return false;
+                    }
+                }
+                break;
+            }
+        }
+        true
+    }
+    /// sem_up
+    pub fn sem_up(&self, sem_id: usize) {
+        let mut inner = self.inner_exclusive_access();
+        let tid = inner.tasks.iter().position(|x| {
+            x.clone()
+                .is_some_and(|x| x.inner_exclusive_access().task_status == TaskStatus::Running)
+        }).unwrap();
+        inner.allocation_semaphore_list[tid][sem_id] -= 1;
     }
 }
